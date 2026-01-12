@@ -4,7 +4,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -94,6 +94,7 @@ class USDExchangePredictor:
         self.best_model = None
         self.feature_importance = None
         self.trained = False
+        self.last_date = None
         
     def load_and_process_data(self):
         """Load and process all datasets"""
@@ -155,6 +156,9 @@ class USDExchangePredictor:
             df['year'] = df['date'].dt.year
             df['month'] = df['date'].dt.month
             
+            # Store the last date for forecasting
+            self.last_date = df['date'].max()
+            
             # Drop date column and filter out 2025
             df = df.drop(columns=['date'])
             df = df[df['year'] != 2025]
@@ -199,6 +203,9 @@ class USDExchangePredictor:
         # Add year and month
         data['year'] = [d.year for d in dates]
         data['month'] = [d.month for d in dates]
+        
+        # Store last date
+        self.last_date = dates[-1]
         
         return data
     
@@ -245,6 +252,9 @@ class USDExchangePredictor:
         self.X_test = X_test_scaled
         self.y_train = y_train
         self.y_test = y_test
+        
+        # Store feature names for later use
+        self.feature_names = X_train.columns.tolist()
         
         # 1. Decision Tree
         start_time = time.time()
@@ -384,55 +394,78 @@ class USDExchangePredictor:
     def forecast_future(self, forecast_months=12):
         """Forecast future USD values"""
         if self.best_model is None:
+            st.warning("No best model available for forecasting")
             return None
         
         # Get last available data
         last_row = self.df.iloc[-1]
-        last_year = last_row['year']
-        last_month = last_row['month']
+        last_year = int(last_row['year'])
+        last_month = int(last_row['month'])
         
         # Create future dates
         future_dates = []
+        future_years = []
+        future_months = []
+        
         current_year = last_year
         current_month = last_month
         
-        for _ in range(forecast_months):
+        for i in range(forecast_months):
             current_month += 1
             if current_month > 12:
                 current_month = 1
                 current_year += 1
+            
             future_dates.append(f"{current_year}-{current_month:02d}")
+            future_years.append(current_year)
+            future_months.append(current_month)
         
         # Create future dataframe with same features
         future_data = []
         for i in range(forecast_months):
-            # Use the last values as baseline, with small trends
+            # Start with the last row values
             row = last_row.copy()
-            row['year'] = current_year
-            row['month'] = current_month
             
-            # Add small trends for economic indicators
+            # Update year and month
+            row['year'] = future_years[i]
+            row['month'] = future_months[i]
+            
+            # Add trends for economic indicators
+            # Simple trend: small growth for GDP/GNI, small random variations for others
             growth_factor = 1 + (0.005 * (i+1))  # 0.5% growth per period
+            
+            # Apply trends
             row['gdp'] = row['gdp'] * growth_factor
             row['gni'] = row['gni'] * growth_factor
             row['leading'] = row['leading'] * (1 + np.random.uniform(-0.005, 0.01))
             row['coincident'] = row['coincident'] * (1 + np.random.uniform(-0.005, 0.01))
             row['lagging'] = row['lagging'] * (1 + np.random.uniform(-0.005, 0.01))
+            
+            # Keep other features relatively stable with small random variations
+            row['Net migration'] = row['Net migration'] * (1 + np.random.uniform(-0.02, 0.02))
+            row['inflation'] = row['inflation'] * (1 + np.random.uniform(-0.01, 0.01))
+            row['leading_diffusion'] = row['leading_diffusion'] * (1 + np.random.uniform(-0.005, 0.005))
+            row['coincident_diffusion'] = row['coincident_diffusion'] * (1 + np.random.uniform(-0.005, 0.005))
+            
             future_data.append(row)
         
         future_df = pd.DataFrame(future_data)
         
         # Prepare features (using the same features as training)
-        # Get the columns used during training
-        if hasattr(self, 'X_train') and self.X_train is not None:
-            # We need to know which features were used
-            # Since we don't have the original column names after scaling,
-            # we'll use the manual feature selection
-            X_future = future_df[['gdp', 'gni', 'lagging', 'coincident', 'leading', 'year']]
+        # Use manual feature selection as default
+        if hasattr(self, 'feature_names') and self.feature_names:
+            # Filter to only include features that were used in training
+            available_features = [f for f in self.feature_names if f in future_df.columns]
+            if available_features:
+                X_future = future_df[available_features]
+            else:
+                # Fallback to manual features
+                X_future = future_df[['gdp', 'gni', 'lagging', 'coincident', 'leading', 'year']]
         else:
             # Default to manual features
             X_future = future_df[['gdp', 'gni', 'lagging', 'coincident', 'leading', 'year']]
         
+        # Scale the features
         X_future_scaled = self.scaler.transform(X_future)
         
         # Make predictions
@@ -441,6 +474,8 @@ class USDExchangePredictor:
         # Create forecast dataframe
         forecast_df = pd.DataFrame({
             'Year-Month': future_dates,
+            'Year': future_years,
+            'Month': future_months,
             'Forecasted_USD': forecasts
         })
         
@@ -580,7 +615,7 @@ def show_overview_page(predictor):
         st.subheader("📈 Economic Trends")
         
         if 'year' in predictor.df.columns and 'month' in predictor.df.columns:
-            # Create date column for plotting
+            # Create date strings for plotting
             plot_df = predictor.df.copy()
             plot_df['YearMonth'] = plot_df['year'].astype(str) + '-' + plot_df['month'].astype(str).str.zfill(2)
             
@@ -1157,61 +1192,89 @@ def show_predictions_page(predictor):
                     
                     st.dataframe(display_df, use_container_width=True)
                     
-                    # Create forecast visualization
-                    fig = go.Figure()
+                    # Prepare historical data for plotting
+                    st.subheader("📈 Forecast Visualization")
                     
-                    # Historical data (last 24 months)
+                    # Get historical data
                     historical_df = predictor.df.copy()
-                    historical_df = historical_df.sort_values(['year', 'month'])
-                    historical_df = historical_df.tail(24)  # Last 2 years
                     
-                    # Create date for historical data
+                    # Sort historical data
+                    historical_df = historical_df.sort_values(['year', 'month'])
+                    
+                    # Take last 24 months of historical data
+                    historical_df = historical_df.tail(24)
+                    
+                    # Create date strings for historical data
                     historical_dates = []
+                    historical_values = []
+                    
                     for _, row in historical_df.iterrows():
-                        historical_dates.append(f"{int(row['year'])}-{int(row['month']):02d}")
+                        date_str = f"{int(row['year'])}-{int(row['month']):02d}"
+                        historical_dates.append(date_str)
+                        historical_values.append(row['USD'])
+                    
+                    # Prepare forecast data
+                    forecast_dates = forecast_df['Year-Month'].tolist()
+                    forecast_values = forecast_df['Forecasted_USD'].tolist()
+                    
+                    # Calculate confidence intervals
+                    forecast_std = forecast_df['Forecasted_USD'].std()
+                    upper_bound = forecast_df['Forecasted_USD'] + (forecast_std * (confidence_level/100))
+                    lower_bound = forecast_df['Forecasted_USD'] - (forecast_std * (confidence_level/100))
+                    
+                    # Create the plot
+                    fig = go.Figure()
                     
                     # Add historical data
                     fig.add_trace(go.Scatter(
                         x=historical_dates,
-                        y=historical_df['USD'],
+                        y=historical_values,
                         mode='lines+markers',
                         name='Historical USD',
                         line=dict(color='#3498db', width=2),
-                        marker=dict(size=4)
+                        marker=dict(size=4, color='#3498db')
                     ))
                     
-                    # Add forecast
+                    # Add forecast data
                     fig.add_trace(go.Scatter(
-                        x=forecast_df['Year-Month'],
-                        y=forecast_df['Forecasted_USD'],
+                        x=forecast_dates,
+                        y=forecast_values,
                         mode='lines+markers',
                         name='Forecasted USD',
                         line=dict(color='#e74c3c', width=3, dash='dash'),
-                        marker=dict(size=6)
+                        marker=dict(size=6, color='#e74c3c')
                     ))
                     
                     # Add confidence interval
-                    std_dev = forecast_df['Forecasted_USD'].std()
-                    upper_bound = forecast_df['Forecasted_USD'] + (std_dev * (confidence_level/100))
-                    lower_bound = forecast_df['Forecasted_USD'] - (std_dev * (confidence_level/100))
-                    
                     fig.add_trace(go.Scatter(
-                        x=forecast_df['Year-Month'].tolist() + forecast_df['Year-Month'].tolist()[::-1],
-                        y=upper_bound.tolist() + lower_bound.tolist()[::-1],
+                        x=forecast_dates + forecast_dates[::-1],  # x, then x reversed
+                        y=upper_bound.tolist() + lower_bound.tolist()[::-1],  # upper, then lower reversed
                         fill='toself',
                         fillcolor='rgba(231, 76, 60, 0.2)',
                         line=dict(color='rgba(255,255,255,0)'),
-                        name=f'{confidence_level}% Confidence Interval'
+                        name=f'{confidence_level}% Confidence Interval',
+                        showlegend=True
                     ))
                     
+                    # Update layout
                     fig.update_layout(
                         title=f'{forecast_months}-Month USD Exchange Rate Forecast',
                         xaxis_title='Year-Month',
                         yaxis_title='USD/MYR Exchange Rate',
                         template='plotly_white',
-                        height=500,
+                        height=600,
                         xaxis=dict(
-                            tickangle=45
+                            tickangle=45,
+                            tickmode='array',
+                            tickvals=historical_dates[::3] + forecast_dates[::3],
+                            ticktext=historical_dates[::3] + forecast_dates[::3]
+                        ),
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=1.02,
+                            xanchor="right",
+                            x=1
                         )
                     )
                     
@@ -1235,9 +1298,9 @@ def show_predictions_page(predictor):
                         st.metric("Maximum Forecast", f"{max_forecast:.4f}")
                     
                     with col4:
-                        last_historical = historical_df['USD'].iloc[-1]
+                        last_historical = historical_values[-1] if historical_values else 0
                         last_forecast = forecast_df['Forecasted_USD'].iloc[-1]
-                        change = ((last_forecast - last_historical) / last_historical) * 100
+                        change = ((last_forecast - last_historical) / last_historical) * 100 if last_historical != 0 else 0
                         st.metric("Final Change", f"{change:.2f}%")
                     
                     # Forecast interpretation
